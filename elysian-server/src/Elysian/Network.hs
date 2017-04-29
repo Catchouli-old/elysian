@@ -46,7 +46,6 @@ data ClientId = ClientId (Digest SHA1) deriving Show
 data Client = Client
                 { _connInfo :: ConnInfo
                 , _clientId :: ClientId
-                , _newMessages :: MVar (V.Vector BS.ByteString)
                 }
 makeLenses ''Client
 
@@ -54,7 +53,8 @@ makeLenses ''Client
 -- | The server state (connected clients etc)
 
 data ServerState = ServerState
-                     { _clientList :: [Client]
+                     { _quitSignal :: MVar Bool
+                     , _clientList :: V.Vector Client
                      }
 makeLenses ''ServerState
 
@@ -89,60 +89,54 @@ clientHash = hash
 
 -- | Start the listening thread, the main thread, and the command listener
 
-startListening :: ServerConfig -> IO ()
+startListening :: ServerConfig -> IO (MVar ServerState)
 startListening serverConfig = NS.withSocketsDo $ do
-  -- New clients list mvar
+  -- Signal that can be set to signal the other threads to exit
   quitSignal <- newMVar False
-  newClients <- newMVar []
+
+  -- Server state
+  let defaultServerState = ServerState quitSignal V.empty
+  serverState <- newMVar defaultServerState
 
   -- Set up listening socket
   let port = serverConfig ^. listenPort
   listenSock <- N.listenOn $ port
-  forkIO $ listenForNew serverConfig listenSock newClients quitSignal
-
-  -- Set up main loop for connected clients
-  let defaultServerState = ServerState []
-  let updateLoop = runStateT (updateClients serverConfig newClients quitSignal) defaultServerState
-  forkIO $ void updateLoop
+  forkIO $ listenForNew serverConfig listenSock quitSignal
 
   -- Command loop
   let loop = do
       a <- getLine
       case a of
-           "q" -> modifyMVar_ quitSignal (return . const True)
-           _      -> return ()
+           "q" -> do modifyMVar_ quitSignal (return . const True)
+                     NS.close listenSock
+           _   -> return ()
       quitting <- readMVar quitSignal
       unless quitting loop
-  loop
+  forkIO loop
 
-  -- Clean up if exiting
-  -- TODO: should probably check that listenForNew and updateClients threads exited
-  -- before exiting
-  NS.close listenSock
-
+  return serverState
 
 -- | Listen for new clients on a listening socket, adding them to a new clients list
 
-listenForNew :: ServerConfig -> NS.Socket -> MVar [Client] -> MVar Bool -> IO ()
-listenForNew serverConfig socket newClients quitSignal = do
+listenForNew :: ServerConfig -> NS.Socket -> MVar Bool -> IO ()
+listenForNew serverConfig socket quitSignal = do
   -- Wait for a new connection
   (sock, sockAddr) <- NS.accept socket
   let connInfo = ConnInfo sock sockAddr
-  msgQueue <- newMVar V.empty
   let clientId = ClientId $ clientHash (BSC.pack . show $ sockAddr)
-  let client = Client connInfo clientId msgQueue
+  let client = Client connInfo clientId
 
   -- Fork off a thread to process new messages
   forkIO $ processSocket serverConfig client quitSignal
 
-  -- Add to new clients list
-  modifyMVar_ newClients $ return . (client:)
+  -- Client connected callback
+  serverConfig ^. clientConnected $ clientId
 
   -- Check if quitting
   quitting <- readMVar quitSignal
 
   -- Loop
-  unless quitting $ listenForNew serverConfig socket newClients quitSignal
+  unless quitting $ listenForNew serverConfig socket quitSignal
 
 
 -- | Process messages from a client and parse them for the update loop
@@ -169,11 +163,9 @@ processSocket serverConfig client quitSignal = do
     let packets = tokenise "\r\n" msg
 
     -- Some debug output
-    let addr = client ^. connInfo ^. sockAddr
+    let cid = client ^. clientId
     forM_ packets $ \p -> unless (BS.null p) $ do
-      let newMsgs = client ^. newMessages
-      putStrLn $ "got message from client " ++ show addr ++ ": " ++ (show . BSC.unpack $ p)
-      modifyMVar_ newMsgs (\v -> return $ V.snoc v p)
+      (serverConfig ^. clientMessage) cid p
 
     -- Check if quitting
     quitting <- readMVar quitSignal
@@ -181,33 +173,3 @@ processSocket serverConfig client quitSignal = do
     -- Loop
     unless quitting $ processSocket serverConfig client quitSignal
 
-
--- | Main loop for connected clients
-
-updateClients :: ServerConfig -> MVar [Client] -> MVar Bool -> StateT ServerState IO ()
-updateClients serverConfig newClientList quitSignal = do
-  -- Check for new clients
-  newClients <- liftIO $ takeMVar newClientList
-  liftIO $ putMVar newClientList []
-  forM_ newClients $ \client ->
-      liftIO $ serverConfig ^. clientConnected $ client ^. clientId
-
-  -- Add new clients
-  modifying clientList (++newClients)
-
-  -- Process clients
-  clients <- use clientList
-  forM_ clients $ \client -> do
-    -- Get new messages and process them
-    msgQueue <- liftIO $ takeMVar (client ^. newMessages)
-    liftIO $ putMVar (client ^. newMessages) V.empty
-
-    forM_ msgQueue $ \msg -> do
-      liftIO $ putStrLn $ "Got message from client: " ++ BSC.unpack msg
-
-  -- Delay 50ms
-  liftIO $ threadDelay 50000
-
-  -- Loop
-  quitting <- liftIO $ readMVar quitSignal
-  unless quitting $ updateClients serverConfig newClientList quitSignal

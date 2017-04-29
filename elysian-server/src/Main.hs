@@ -16,4 +16,6 @@ serverConfig = defaultConfig
 
 -- | Start our listening server
 
-main = startListening serverConfig
+main = do
+  server <- startListening serverConfig
+  putStrLn "Server started"
