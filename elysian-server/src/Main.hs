@@ -1,6 +1,6 @@
 module Main where
 
-import Elysian.Network
+import Elysian.Network.Server
 import Control.Monad
 import Control.Concurrent (forkIO, threadDelay)
 import qualified Data.Map.Strict as M

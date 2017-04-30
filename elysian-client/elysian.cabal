@@ -19,3 +19,9 @@ executable elysian
   default-language:    Haskell2010
   build-depends:       base >= 4.7 && < 5
                      , elerea
+                     , network
+                     , bytestring
+                     , safe-exceptions
+                     , microlens
+                     , microlens-th
+                     , microlens-mtl

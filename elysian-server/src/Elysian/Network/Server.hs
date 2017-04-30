@@ -1,6 +1,6 @@
 {-# LANGUAGE TemplateHaskell, OverloadedStrings #-}
 
-module Elysian.Network
+module Elysian.Network.Server
   ( startListening
   , stopListening
   , isQuitting
@@ -24,6 +24,7 @@ import Lens.Micro
 import Lens.Micro.Mtl
 import Lens.Micro.TH
 import Crypto.Hash
+import Control.Exception.Safe
 import qualified Data.Map.Strict as M
 import qualified Data.Vector as V
 import qualified Data.ByteString as BS
@@ -56,7 +57,7 @@ data Client = Client
 makeLenses ''Client
 
 
--- | The server state (connected clients etc)
+-- | The server state (connected clients etce
 
 data ServerState = ServerState
                      { _quitSignal :: MVar Bool
@@ -66,7 +67,7 @@ data ServerState = ServerState
 makeLenses ''ServerState
 
 
--- | An encapsulation for the server state that we can pass out
+-- | An encapsulation for the server state that we can pass out of this module
 
 data Server = Server (MVar ServerState)
 
@@ -187,37 +188,41 @@ listenForNew serverConfig serverState socket quitSignal = do
 -- | Process messages from a client and parse them for the update loop
 
 processSocket :: ServerConfig -> MVar ServerState -> Client -> MVar Bool -> IO ()
-processSocket serverConfig serverState client quitSignal = do
-  let server = Server serverState
+processSocket serverConfig serverState client quitSignal =
+  let cid = client ^. clientId
+      socketRead = do
+        let server = Server serverState
+        let sock = client ^. connInfo ^. socket
+        msg <- NS.recv sock 256
+        let zeroLength = BS.length msg == 0
+        
+        -- 0-length message means the other end closed their socket
+        when zeroLength $ do
+          (serverConfig ^. clientDisconnected) server cid
+          modifyMVar_ serverState $ \s -> return s { _clientList = M.delete cid (s ^. clientList) }
 
-  -- Read from socket
-  let sock = client ^. connInfo ^. socket
-  msg <- NS.recv sock 256
-  let zeroLength = BS.length msg == 0
-  
-  -- 0-length message means the other end closed their socket
-  when zeroLength $ do
-    let cid = client ^. clientId
-    (serverConfig ^. clientDisconnected) server cid
-    modifyMVar_ serverState $ \s -> return s { _clientList = M.delete cid (s ^. clientList) }
+        -- If the message is valid process it
+        unless zeroLength $ do
+          -- A function to tokenise a bytestring
+          let tokenise x y = h : if BS.null t then [] else tokenise x (BS.drop (BS.length x) t)
+                where (h,t) = BS.breakSubstring x y
 
-  -- If the message is valid process it
-  unless zeroLength $ do
-    -- A function to tokenise a bytestring
-    let tokenise x y = h : if BS.null t then [] else tokenise x (BS.drop (BS.length x) t)
-          where (h,t) = BS.breakSubstring x y
+          -- Break message up into CRLF divided packets
+          let packets = tokenise "\r\n" msg
 
-    -- Break message up into CRLF divided packets
-    let packets = tokenise "\r\n" msg
+          -- Some debug output
+          forM_ packets $ \p -> unless (BS.null p) $ do
+            (serverConfig ^. clientMessage) server cid p
 
-    -- Some debug output
-    let cid = client ^. clientId
-    forM_ packets $ \p -> unless (BS.null p) $ do
-      (serverConfig ^. clientMessage) server cid p
+          -- Check if quitting
+          quitting <- readMVar quitSignal
 
-    -- Check if quitting
-    quitting <- readMVar quitSignal
+          -- Loop
+          unless quitting $ processSocket serverConfig serverState client quitSignal
 
-    -- Loop
-    unless quitting $ processSocket serverConfig serverState client quitSignal
+      onFailure _ = do
+        putStrLn $ "Read from client socket " ++ show cid ++ " failed, removing client"
+        modifyMVar_ serverState $ \s -> return s { _clientList = M.delete cid (s ^. clientList) }
+
+  in catchAny socketRead onFailure
 

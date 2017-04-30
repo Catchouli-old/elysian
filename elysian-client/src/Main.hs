@@ -6,28 +6,27 @@
 
 module Main where
 
-import Control.Monad (forM)
-import FRP.Elerea.Param
 
-
--- | A version of stateful that doesn't delay the input by 1
-
-stateful' :: a -> (p -> a -> a) -> SignalGen p (Signal a)
-stateful' initial f = do
-  transfer initial
-           (\input _ value -> f input value)
-           (pure undefined)
-
-
---createHistory = newIORef []
-
-network :: SignalGen p (Signal Bool)
-network input = return ()
-
+import Control.Concurrent
+import Elysian.Network.Client
+import qualified Data.ByteString.Char8 as BSC
 
 
 main :: IO ()
 main = do
-  smp <- start (stateful' "" (:))
-  res <- forM "olleh~" smp
-  print res
+  client <- connect "127.0.0.1" 12345
+  case client of
+       Just c -> clientThread c
+       Nothing -> putStrLn "Failed to connect to server"
+
+
+clientThread :: Client -> IO ()
+clientThread c =
+  -- Main loop
+  let loop = do
+      sendMessage c $ BSC.pack "hello there"
+
+      -- wait a second
+      threadDelay 1000000
+      loop
+  in loop
