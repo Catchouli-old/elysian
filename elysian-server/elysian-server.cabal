@@ -28,3 +28,4 @@ executable elysian-server
                      , vector
                      , elysian-common
                      , cryptonite
+                     , containers

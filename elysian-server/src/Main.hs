@@ -2,6 +2,7 @@ module Main where
 
 import Elysian.Network
 import Control.Monad
+import qualified Data.Map.Strict as M
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
 
@@ -19,20 +20,20 @@ serverConfig = defaultConfig
 
 -- | Client connected handler
 
-clientConnected :: ClientId -> IO ()
-clientConnected c = putStrLn $ "Client " ++ show c ++ " connected"
+clientConnected :: Server -> ClientId -> IO ()
+clientConnected s c = putStrLn $ "Client " ++ show c ++ " connected"
 
 
 -- | Client connected handler
 
-clientDisconnected :: ClientId -> IO ()
-clientDisconnected c = putStrLn $ "Client " ++ show c ++ " disconnected"
+clientDisconnected :: Server -> ClientId -> IO ()
+clientDisconnected s c = putStrLn $ "Client " ++ show c ++ " disconnected"
 
 
 -- | Client connected handler
 
-clientMessage :: ClientId -> BS.ByteString -> IO ()
-clientMessage c m = putStrLn $ "Message from " ++ show c ++ ": " ++ BSC.unpack m
+clientMessage :: Server -> ClientId -> BS.ByteString -> IO ()
+clientMessage s c m = putStrLn $ "Message from " ++ show c ++ ": " ++ BSC.unpack m
 
 
 -- | Start our listening server
@@ -46,6 +47,7 @@ main = do
       a <- getLine
       case a of
            "q" -> stopListening server
+           "c" -> getClients server >>= \clients -> mapM_ (putStrLn . show) (M.keys clients)
            _   -> return ()
       quitting <- isQuitting server
       unless quitting loop

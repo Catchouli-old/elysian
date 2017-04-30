@@ -4,11 +4,13 @@ module Elysian.Network
   ( startListening
   , stopListening
   , isQuitting
+  , getClients
   , ServerConfig(..)
   , defaultConfig
   , N.PortID(..)
   , clientHash
   , ClientId
+  , Server
   )
 where
 
@@ -21,6 +23,7 @@ import Lens.Micro
 import Lens.Micro.Mtl
 import Lens.Micro.TH
 import Crypto.Hash
+import qualified Data.Map.Strict as M
 import qualified Data.Vector as V
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BSC
@@ -40,7 +43,7 @@ makeLenses ''ConnInfo
 
 -- | Client id
 
-data ClientId = ClientId (Digest SHA1) deriving Show
+data ClientId = ClientId (Digest SHA1) deriving (Show, Ord, Eq)
 
 
 -- | Information about a connected client
@@ -56,19 +59,24 @@ makeLenses ''Client
 
 data ServerState = ServerState
                      { _quitSignal :: MVar Bool
-                     , _clientList :: V.Vector Client
+                     , _clientList :: M.Map ClientId Client
                      , _listenSock :: NS.Socket
                      }
 makeLenses ''ServerState
+
+
+-- | An encapsulation for the server state that we can pass out
+
+data Server = Server (MVar ServerState)
 
 
 -- | The server config (port, callbacks etc)
 
 data ServerConfig = ServerConfig
                       { _listenPort :: N.PortID
-                      , _clientConnected :: ClientId -> IO ()
-                      , _clientDisconnected :: ClientId -> IO ()
-                      , _clientMessage :: ClientId -> BS.ByteString -> IO ()
+                      , _clientConnected :: Server -> ClientId -> IO ()
+                      , _clientDisconnected :: Server -> ClientId -> IO ()
+                      , _clientMessage :: Server -> ClientId -> BS.ByteString -> IO ()
                       }
 makeLenses ''ServerConfig
 
@@ -78,9 +86,9 @@ makeLenses ''ServerConfig
 defaultConfig :: ServerConfig
 defaultConfig = ServerConfig
                   { _listenPort = N.PortNumber 0
-                  , _clientConnected = \_ -> return ()
-                  , _clientDisconnected = \_ -> return ()
-                  , _clientMessage = \_ _ -> return ()
+                  , _clientConnected = \_ _ -> return ()
+                  , _clientDisconnected = \_ _ -> return ()
+                  , _clientMessage = \_ _ _ -> return ()
                   }
 
 
@@ -92,7 +100,7 @@ clientHash = hash
 
 -- | Start the listening thread, the main thread, and the command listener
 
-startListening :: ServerConfig -> IO (MVar ServerState)
+startListening :: ServerConfig -> IO Server
 startListening serverConfig = NS.withSocketsDo $ do
   -- Signal that can be set to signal the other threads to exit
   quitSignal <- newMVar False
@@ -100,19 +108,21 @@ startListening serverConfig = NS.withSocketsDo $ do
   -- Set up listening socket
   let port = serverConfig ^. listenPort
   listenSock <- N.listenOn $ port
-  forkIO $ listenForNew serverConfig listenSock quitSignal
 
   -- Server state
-  let defaultServerState = ServerState quitSignal V.empty listenSock
+  let defaultServerState = ServerState quitSignal M.empty listenSock
   serverState <- newMVar defaultServerState
 
-  return serverState
+  -- Fork listening thread
+  forkIO $ listenForNew serverConfig serverState listenSock quitSignal
+
+  return $ Server serverState
 
 
 -- | Stop listening
 
-stopListening :: MVar ServerState -> IO ()
-stopListening state = do
+stopListening :: Server -> IO ()
+stopListening (Server state) = do
   serverState <- readMVar state
   modifyMVar_ (serverState ^. quitSignal) (return . const True)
   NS.close (serverState ^. listenSock)
@@ -120,39 +130,54 @@ stopListening state = do
 
 -- | Whether stopListening has been called
 
-isQuitting :: MVar ServerState -> IO Bool
-isQuitting state = do
+isQuitting :: Server -> IO Bool
+isQuitting (Server state) = do
   serverState <- readMVar state
   readMVar (serverState ^. quitSignal)
 
 
+-- | Get a list of clients
+
+getClients :: Server -> IO (M.Map ClientId Client)
+getClients (Server state) = do
+  serverState <- readMVar state
+  return $ serverState ^. clientList
+
+
 -- | Listen for new clients on a listening socket, adding them to a new clients list
 
-listenForNew :: ServerConfig -> NS.Socket -> MVar Bool -> IO ()
-listenForNew serverConfig socket quitSignal = do
+listenForNew :: ServerConfig -> MVar ServerState -> NS.Socket -> MVar Bool -> IO ()
+listenForNew serverConfig serverState socket quitSignal = do
+  let server = Server serverState
+
   -- Wait for a new connection
   (sock, sockAddr) <- NS.accept socket
   let connInfo = ConnInfo sock sockAddr
   let clientId = ClientId $ clientHash (BSC.pack . show $ sockAddr)
   let client = Client connInfo clientId
 
+  -- Add new client
+  modifyMVar_ serverState $ \s -> return s { _clientList = M.insert clientId client (s ^. clientList) }
+
   -- Fork off a thread to process new messages
-  forkIO $ processSocket serverConfig client quitSignal
+  forkIO $ processSocket serverConfig serverState client quitSignal
 
   -- Client connected callback
-  serverConfig ^. clientConnected $ clientId
+  (serverConfig ^. clientConnected) server clientId
 
   -- Check if quitting
   quitting <- readMVar quitSignal
 
   -- Loop
-  unless quitting $ listenForNew serverConfig socket quitSignal
+  unless quitting $ listenForNew serverConfig serverState socket quitSignal
 
 
 -- | Process messages from a client and parse them for the update loop
 
-processSocket :: ServerConfig -> Client -> MVar Bool -> IO ()
-processSocket serverConfig client quitSignal = do
+processSocket :: ServerConfig -> MVar ServerState -> Client -> MVar Bool -> IO ()
+processSocket serverConfig serverState client quitSignal = do
+  let server = Server serverState
+
   -- Read from socket
   let sock = client ^. connInfo ^. socket
   msg <- NS.recv sock 256
@@ -161,7 +186,8 @@ processSocket serverConfig client quitSignal = do
   -- 0-length message means the other end closed their socket
   when zeroLength $ do
     let cid = client ^. clientId
-    serverConfig ^. clientDisconnected $ cid
+    (serverConfig ^. clientDisconnected) server cid
+    modifyMVar_ serverState $ \s -> return s { _clientList = M.delete cid (s ^. clientList) }
 
   -- If the message is valid process it
   unless zeroLength $ do
@@ -175,11 +201,11 @@ processSocket serverConfig client quitSignal = do
     -- Some debug output
     let cid = client ^. clientId
     forM_ packets $ \p -> unless (BS.null p) $ do
-      (serverConfig ^. clientMessage) cid p
+      (serverConfig ^. clientMessage) server cid p
 
     -- Check if quitting
     quitting <- readMVar quitSignal
 
     -- Loop
-    unless quitting $ processSocket serverConfig client quitSignal
+    unless quitting $ processSocket serverConfig serverState client quitSignal
 
