@@ -2,6 +2,8 @@
 
 module Elysian.Network
   ( startListening
+  , stopListening
+  , isQuitting
   , ServerConfig(..)
   , defaultConfig
   , N.PortID(..)
@@ -55,6 +57,7 @@ makeLenses ''Client
 data ServerState = ServerState
                      { _quitSignal :: MVar Bool
                      , _clientList :: V.Vector Client
+                     , _listenSock :: NS.Socket
                      }
 makeLenses ''ServerState
 
@@ -94,27 +97,34 @@ startListening serverConfig = NS.withSocketsDo $ do
   -- Signal that can be set to signal the other threads to exit
   quitSignal <- newMVar False
 
-  -- Server state
-  let defaultServerState = ServerState quitSignal V.empty
-  serverState <- newMVar defaultServerState
-
   -- Set up listening socket
   let port = serverConfig ^. listenPort
   listenSock <- N.listenOn $ port
   forkIO $ listenForNew serverConfig listenSock quitSignal
 
-  -- Command loop
-  let loop = do
-      a <- getLine
-      case a of
-           "q" -> do modifyMVar_ quitSignal (return . const True)
-                     NS.close listenSock
-           _   -> return ()
-      quitting <- readMVar quitSignal
-      unless quitting loop
-  forkIO loop
+  -- Server state
+  let defaultServerState = ServerState quitSignal V.empty listenSock
+  serverState <- newMVar defaultServerState
 
   return serverState
+
+
+-- | Stop listening
+
+stopListening :: MVar ServerState -> IO ()
+stopListening state = do
+  serverState <- readMVar state
+  modifyMVar_ (serverState ^. quitSignal) (return . const True)
+  NS.close (serverState ^. listenSock)
+
+
+-- | Whether stopListening has been called
+
+isQuitting :: MVar ServerState -> IO Bool
+isQuitting state = do
+  serverState <- readMVar state
+  readMVar (serverState ^. quitSignal)
+
 
 -- | Listen for new clients on a listening socket, adding them to a new clients list
 
