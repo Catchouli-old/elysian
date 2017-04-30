@@ -5,6 +5,7 @@ module Elysian.Network
   , stopListening
   , isQuitting
   , getClients
+  , sendMessage
   , ServerConfig(..)
   , defaultConfig
   , N.PortID(..)
@@ -142,6 +143,17 @@ getClients :: Server -> IO (M.Map ClientId Client)
 getClients (Server state) = do
   serverState <- readMVar state
   return $ serverState ^. clientList
+
+
+-- | Send a message to a client
+
+sendMessage :: Server -> ClientId -> BS.ByteString -> IO ()
+sendMessage (Server state) cid msg = do
+  serverState <- readMVar state
+  let client = M.lookup cid (serverState ^. clientList)
+  case client of
+       Nothing -> putStrLn $ "Tried to send message to invalid client " ++ show cid
+       Just c  -> void $ NS.send (c ^. connInfo ^. socket) msg
 
 
 -- | Listen for new clients on a listening socket, adding them to a new clients list
